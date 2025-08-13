@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NL Wildfire Live Map — ArcGIS Feed</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+    .panel {
+      position: absolute; top: 12px; left: 12px;
+      background: rgba(255,255,255,0.95); padding: 10px 12px;
+      border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      z-index: 1000; max-width: 460px;
+    }
+    .panel h1 { font-size: 16px; margin: 0 0 6px; }
+    .panel p { margin: 4px 0; font-size: 13px; }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #333; }
+    .swatch.red { background: rgba(220, 38, 38, 0.35); border-color: #b91c1c; }
+    .swatch.purple { background: rgba(124, 58, 237, 0.25); border-color: #6d28d9; }
+    .swatch.yellow { background: #fde047; border-color: #a16207; }
+    .controls { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    button {
+      appearance: none; border: 0; padding: 8px 10px;
+      border-radius: 8px; background: #111827; color: white; cursor: pointer;
+      font-size: 12px;
+    }
+    button.secondary { background: #374151; }
+    .credit {
+      position: absolute; right: 12px; bottom: 12px;
+      font-size: 11px; color: #374151; background: rgba(255,255,255,0.9);
+      padding: 6px 8px; border-radius: 6px;
+    }
+    .error { color: #b91c1c; font-size: 12px; margin-top: 4px; }
+    .ok { color: #065f46; font-size: 12px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>NL Wildfire Live Map — ArcGIS Feed</h1>
+    <p>Auto‑refreshes every <b>5 minutes</b>. Use the buttons below to refresh or fit to layers.</p>
+    <p><b>Data Sources</b> (override with <code>?fires=URL</code> and <code>?evac=URL</code>):</p>
+    <ul style="margin:4px 0 6px 18px; padding:0;">
+      <li>Fires: <code id="firesrc"></code></li>
+      <li>Evac: <code id="evacsrc"></code></li>
+    </ul>
+    <div class="legend-item"><span class="swatch red"></span> Fire perimeter(s) / features</div>
+    <div class="legend-item"><span class="swatch purple"></span> Evacuation zone(s)</div>
+    <div class="legend-item"><span class="swatch yellow"></span> Colonial St. (yellow pin)</div>
+    <div class="controls">
+      <button id="refresh">Refresh</button>
+      <button id="fit" class="secondary">Fit to layers</button>
+    </div>
+    <p id="status">Last updated: …</p>
+    <div id="msg" class="ok"></div>
+  </div>
+  <div id="map"></div>
+  <div class="credit">Basemap © OpenStreetMap | Built with Leaflet</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const DEFAULT_FIRES_URL = "https://services.arcgis.com/wjcPoefzjpzCgffS/ArcGIS/rest/services/activefires/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=geojson";
+    const DEFAULT_EVAC_URL  = ""; // optional
+
+    const COLONIAL_COORDS = [-52.7096, 47.5621];
+
+    function getParam(name) { const u = new URL(window.location.href); return u.searchParams.get(name); }
+    const firesURL = getParam('fires') || DEFAULT_FIRES_URL;
+    const evacURL  = getParam('evac')  || DEFAULT_EVAC_URL;
+    document.getElementById('firesrc').textContent = firesURL || '(none)';
+    document.getElementById('evacsrc').textContent  = evacURL || '(none)';
+
+    const map = L.map('map');
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    map.setView([47.56, -52.71], 11);
+
+    const styles = {
+      fire: { color: '#b91c1c', weight: 2, fillColor: 'rgba(220,38,38,0.35)', fillOpacity: 0.35 },
+      evac: { color: '#6d28d9', weight: 2, fillColor: 'rgba(124,58,237,0.25)', fillOpacity: 0.25 },
+      pin:  { radius: 7, color: '#a16207', weight: 1, fillColor: '#fde047', fillOpacity: 1 }
+    };
+
+    let fireLayer, evacLayer, pinLayer;
+
+    async function fetchGeoJSON(url) {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+      return await res.json();
+    }
+
+    async function loadData(fit=false) {
+      const msg = document.getElementById('msg');
+      msg.className = 'ok';
+      msg.textContent = 'Loading…';
+
+      try {
+        const firesPromise = firesURL ? fetchGeoJSON(firesURL) : Promise.resolve(null);
+        const evacPromise  = evacURL  ? fetchGeoJSON(evacURL)  : Promise.resolve(null);
+        const [fireGJ, evacGJ] = await Promise.all([firesPromise, evacPromise]);
+
+        if (fireLayer) map.removeLayer(fireLayer);
+        if (evacLayer) map.removeLayer(evacLayer);
+        if (pinLayer)  map.removeLayer(pinLayer);
+
+        if (fireGJ) fireLayer = L.geoJSON(fireGJ, { style: styles.fire }).addTo(map);
+        if (evacGJ) evacLayer = L.geoJSON(evacGJ,  { style: styles.evac }).addTo(map);
+        pinLayer  = L.geoJSON({
+          type: 'FeatureCollection',
+          features: [{ type: 'Feature', properties: { name: 'Colonial St.' },
+            geometry: { type: 'Point', coordinates: COLONIAL_COORDS } }]
+        }, { pointToLayer: (f, latlng) => L.circleMarker(latlng, styles.pin) }).addTo(map);
+
+        document.getElementById('status').textContent = 'Last updated: ' + new Date().toLocaleString();
+        msg.textContent = 'OK';
+        msg.className = 'ok';
+
+        if (fit) {
+          const layers = [pinLayer];
+          if (fireLayer) layers.push(fireLayer);
+          if (evacLayer) layers.push(evacLayer);
+          const group = L.featureGroup(layers);
+          map.fitBounds(group.getBounds().pad(0.2));
+        }
+      } catch (e) {
+        msg.textContent = 'Error: ' + e.message + ' (check CORS and URLs)';
+        msg.className = 'error';
+      }
+    }
+
+    document.getElementById('refresh').addEventListener('click', () => loadData(true));
+    document.getElementById('fit').addEventListener('click', () => loadData(true));
+
+    loadData(true);
+    setInterval(() => loadData(false), 300000);
+  </script>
+</body>
+</html>
